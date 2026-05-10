@@ -1,102 +1,108 @@
+"""End-to-end smoke test for the *new* Chroma-backed RAG architecture.
+
+This test is intentionally isolated:
+- temp Chroma persist dir
+- unique collection name
+- cleanup teardown
+
+Run:
+  python -m RAG.tests.test_real_rag
 """
-Real RAG Demo - Using actual RAG documentation PDF
 
-This demonstrates the complete RAG pipeline using the 
-'Retrieval Augmented Generation (RAG) for Everyone' PDF
-"""
+from __future__ import annotations
 
-from pdf_ingestion import get_pdf_text
-from chunking import get_chunks
-from embedding import vector_embedding
-from retrieval import search_best_chunks
-from generation import generate_answer
+import os
+import shutil
+import tempfile
+import uuid
 
-def main():
-    print("\n" + "=" * 70)
-    print("📚 RAG SYSTEM - REAL DOCUMENT PROCESSING DEMO")
-    print("=" * 70)
-    
-    # Step 1: Extract PDF text
-    print("\n1️⃣  LOADING PDF DOCUMENT...")
-    pdf_path = "../Retrieval Augmented Generation (RAG) for Everyone (1).pdf"
-    
-    text = get_pdf_text(pdf_path)
-    
-    if text.startswith("❌"):
-        print(f"Error: {text}")
-        return
-    
-    print(f"\n✅ Successfully loaded 57-page RAG document")
-    print(f"   Characters: {len(text):,}")
-    print(f"   Words: {len(text.split()):,}")
-    
-    # Step 2: Chunk the text
-    print("\n2️⃣  CHUNKING TEXT...")
-    chunks = get_chunks(text, chunk_size=300, overlap=75)
-    print(f"   ✅ Created {len(chunks)} chunks (300 chars each, 75 overlap)")
-    
-    # Step 3: Create embeddings
-    print("\n3️⃣  CREATING VECTOR EMBEDDINGS...")
-    vectors, model = vector_embedding(chunks)
-    print(f"   ✅ Generated {len(vectors)} vectors (384-dimensional)")
-    
-    # Step 4: Interactive Q&A
-    print("\n" + "=" * 70)
-    print("🤖 RAG SYSTEM READY - Ask questions about RAG!")
-    print("=" * 70)
-    
-    # Predefined test questions
-    test_questions = [
-        "What is RAG?",
-        "What are the components of RAG?",
-        "What are the advantages of RAG?",
-        "What is chunking in RAG?",
-        "What is semantic caching?"
-    ]
-    
-    print("\nTest Questions:")
-    for i, q in enumerate(test_questions, 1):
-        print(f"{i}. {q}")
-    
-    print("\nType a number (1-5) to ask a test question, or type your own question.")
-    print("Type 'exit' to quit.\n")
-    
-    while True:
-        user_input = input("❓ Your question: ").strip()
-        
-        if user_input.lower() == 'exit':
-            print("\n👋 Goodbye!")
-            break
-        
-        if not user_input:
-            continue
-        
-        # Check if user selected a test question
-        if user_input.isdigit() and 1 <= int(user_input) <= len(test_questions):
-            query = test_questions[int(user_input) - 1]
-            print(f"\nSelected: {query}")
-        else:
-            query = user_input
-        
-        print(f"\n🔍 Searching knowledge base...")
-        
-        # Retrieve relevant chunks
-        results = search_best_chunks(query, model, vectors, chunks, k=3)
-        
-        best_result = results[0]
-        print(f"\n📄 Best Match (confidence: {best_result['score']:.4f}):")
-        print(f"   {best_result['text'][:200]}...")
-        
-        # Generate answer
-        print(f"\n🤖 Generating answer...")
-        try:
-            answer = generate_answer(query, best_result['text'])
-            print(f"\n💬 Answer:\n{answer}")
-        except Exception as e:
-            print(f"\n⚠️  LLM not available. Using retrieved context:")
-            print(f"\n{best_result['text'][:500]}...")
-        
-        print("\n" + "-" * 70 + "\n")
+from RAG.rag_pipeline import RAGPipeline
+from RAG.vector_store import ChromaVectorStore
+
+
+def _make_isolated_pipe() -> RAGPipeline:
+    tmp_dir = tempfile.mkdtemp(prefix="notebookrag_test_chroma_")
+    collection = f"test_{uuid.uuid4().hex[:10]}"
+
+    # Make sure config/env doesn't leak into the test run
+    os.environ["CHROMA_PERSIST_DIR"] = tmp_dir
+    os.environ["CHROMA_COLLECTION"] = collection
+
+    store = ChromaVectorStore(persist_dir=tmp_dir, collection_name=collection)
+    pipe = RAGPipeline(vector_store=store)
+
+    # attach cleanup hook
+    pipe._test_tmp_dir = tmp_dir  # type: ignore[attr-defined]
+    return pipe
+
+
+def _cleanup_pipe(pipe: RAGPipeline) -> None:
+    tmp_dir = getattr(pipe, "_test_tmp_dir", None)
+    if tmp_dir and os.path.isdir(tmp_dir):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_fixed_and_semantic_index_and_retrieve() -> None:
+    pipe = _make_isolated_pipe()
+    try:
+        pdf_path = "RAG/docs/rag_info.pdf"
+        query = "What is RAG?"
+
+        # Fixed chunking
+        doc_id_fixed = f"test-fixed-{uuid.uuid4().hex[:8]}"
+        res_fixed = pipe.index_pdf(
+            file_path=pdf_path,
+            filename="rag_info.pdf",
+            document_id=doc_id_fixed,
+            chunk_strategy="fixed",
+            chunk_size=600,
+            chunk_overlap=120,
+        )
+        assert res_fixed["chunks"] > 0
+
+        hits_fixed = pipe.retrieve(query=query, top_k=5, active_document_id=doc_id_fixed)
+        assert len(hits_fixed) > 0
+
+        h0 = hits_fixed[0]
+        md = h0.metadata
+        assert md.get("filename") == "rag_info.pdf"
+        assert md.get("document_id") == doc_id_fixed
+        assert md.get("page") is not None
+        assert md.get("chunk_id")
+        assert md.get("chunk_index") is not None
+        assert h0.similarity is not None
+        assert 0.0 <= float(h0.similarity) <= 1.0
+
+        # Semantic chunking
+        doc_id_sem = f"test-sem-{uuid.uuid4().hex[:8]}"
+        res_sem = pipe.index_pdf(
+            file_path=pdf_path,
+            filename="rag_info.pdf",
+            document_id=doc_id_sem,
+            chunk_strategy="semantic",
+            chunk_size=600,
+            chunk_overlap=120,
+        )
+        assert res_sem["chunks"] > 0
+
+        hits_sem = pipe.retrieve(query=query, top_k=5, active_document_id=doc_id_sem)
+        assert len(hits_sem) > 0
+        assert all((h.metadata or {}).get("document_id") == doc_id_sem for h in hits_sem)
+
+        # Answer should be grounded (or graceful fallback if generator unavailable)
+        answer, hits = pipe.answer(query=query, top_k=3, active_document_id=doc_id_fixed)
+        assert hits, "expected hits for grounded answering"
+        assert isinstance(answer, str) and answer.strip()
+
+        fallback = "I could not find that in uploaded documents."
+        assert answer == fallback or len(answer) >= 10
+    finally:
+        _cleanup_pipe(pipe)
+
+
+def main() -> None:
+    test_fixed_and_semantic_index_and_retrieve()
+    print("✅ New-architecture RAG smoke test passed (isolated Chroma)")
 
 
 if __name__ == "__main__":
